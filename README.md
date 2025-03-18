@@ -113,18 +113,32 @@ process_sample() {
     bwa mem -t 32 -R "@RG\tID:${sample}\tPL:${platform}\tSM:${sample}" \
         "$file_ref" "${dir_fastp}/${sample}_1_filtered.fastq.gz" "${dir_fastp}/${sample}_2_filtered.fastq.gz" | \
         samtools sort -@ 12 -O BAM -o "${dir_map}/${sample}.bam"
-    
+
+    gatk AddOrReplaceReadGroups -I "${dir_map}/${sample}.bam" \
+        -O "${dir_map}/${sample}_RG.bam" \
+        --RGLB "Lib-${sample}" --RGPL "$platform" \
+        --RGPU "${platform}_${sample}" --RGSM "$sample" \
+        --VALIDATION_STRINGENCY LENIENT
+  
     samtools flagstat "${dir_map}/${sample}.bam" > "${dir_map}/${sample}.Stat.txt"
+
+    gatk MarkDuplicatesSpark -I "${dir_map}/${sample}.bam" \
+        -O "${dir_map}/${sample}_markdup.bam" --spark-master local[12]
     
-    gatk Mutect2 -R "$file_ref" -I "${dir_map}/${sample}.bam" \
+    gatk BaseRecalibrator -I "${dir_map}/${sample}_markdup.bam" \
+        --known-sites "$known_site" -O "${dir_map}/${sample}_recall.table" -R "$file_ref"
+    
+    gatk ApplyBQSR --bqsr-recal-file "${dir_map}/${sample}_recall.table" \
+        -I "${dir_map}/${sample}_markdup.bam" -O "${dir_map}/${sample}_recall.bam" -R "$file_ref"
+    
+    gatk Mutect2 -R "$file_ref" -I "${dir_map}/${sample}_recall.bam" \
         --germline-resource "$af_only" --panel-of-normals "$pon" \
         -O "${dir_vcf}/${sample}.vcf"
     
     gatk FilterMutectCalls -R "$file_ref" -V "${dir_vcf}/${sample}.vcf" \
         -O "${dir_vcf}/${sample}_filtered.vcf"
     
-    bcftools view -f PASS "${dir_vcf}/${sample}_filtered.vcf" -o "${dir_vcf}/${sample}_filtered_pass.vcf"
-}
+    bcftools view -f PASS "${dir_vcf}/${sample}_filtered.vcf" -o "${dir_vcf}/${sample}_filtered_pass.vcf"}
 
 for sample in "${unique_samples[@]}"; do
     if process_sample "$sample"; then
