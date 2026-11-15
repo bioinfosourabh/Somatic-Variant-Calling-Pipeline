@@ -1,0 +1,30 @@
+name: shellcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install shellcheck
+        run: pip install shellcheck-py
+      - name: shellcheck
+        run: shellcheck scripts/*.sh config.sh
+      - name: Help and dry run
+        run: |
+          bash scripts/somatic_variant_calling.sh -h
+          # Dry run with placeholder inputs: argument parsing, config loading,
+          # resource checks and sample discovery, without the tools.
+          mkdir -p /tmp/t/fq /tmp/t/ref
+          touch /tmp/t/fq/T1_1.fastq.gz /tmp/t/fq/T1_2.fastq.gz
+          for f in ref.fa ref.fa.fai ref.dict ref.fa.bwt dbsnp.vcf.gz dbsnp.vcf.gz.tbi gnomad.vcf.gz gnomad.vcf.gz.tbi; do touch /tmp/t/ref/$f; done
+          printf 'file_ref=/tmp/t/ref/ref.fa\nknown_site=/tmp/t/ref/dbsnp.vcf.gz\nknown_indels=()\naf_only=/tmp/t/ref/gnomad.vcf.gz\npon=\n' > /tmp/t/config.sh
+          bash scripts/somatic_variant_calling.sh -i /tmp/t/fq -o /tmp/t/out -c /tmp/t/config.sh -n
