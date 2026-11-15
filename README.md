@@ -1,23 +1,33 @@
 # Somatic Variant Calling Pipeline
 
-## Overview
-This pipeline processes paired-end FASTQ files for **somatic variant calling** using **BWA-MEM, GATK Mutect2, and bcftools**. It performs quality control, read alignment, duplicate marking, base recalibration, and variant calling, generating a **filtered VCF file** for downstream analysis.
+A Bash pipeline that takes paired-end FASTQ files from tumour samples to filtered somatic variant calls (VCF) on the hg38 reference, using fastp, BWA-MEM, samtools, GATK4 (Mutect2) and bcftools.
 
-## Features
-- **End-to-end automation** for somatic variant calling
-- **Quality control and filtering** for reliable variant detection
-- **Parallel processing** for large-scale sequencing data
-- **Logging and error handling** to track each step
+Variants are called in **tumour-only mode**: there is no matched normal, and germline and recurrent artefactual calls are filtered using a panel of normals and a gnomAD allele-frequency germline resource.
 
-## Installation
-Ensure the following tools are installed:
-- **BWA** (Burrows-Wheeler Aligner)
-- **Samtools**
-- **Fastp**
-- **GATK (Genome Analysis Toolkit)**
-- **bcftools**
+## Workflow
 
-To install dependencies (on Ubuntu):
+For each sample, [`scripts/somatic_variant_calling.sh`](scripts/somatic_variant_calling.sh) runs:
+
+| Step | Tool | Output |
+|---|---|---|
+| Read QC and trimming | `fastp` | filtered FASTQ and HTML report |
+| Alignment and sorting | `bwa mem` with read groups, `samtools sort` | sorted BAM |
+| Alignment statistics | `samtools flagstat` | `<sample>.Stat.txt` |
+| Duplicate marking | `gatk MarkDuplicatesSpark` | `<sample>_markdup.bam` |
+| Base quality score recalibration | `gatk BaseRecalibrator`, `gatk ApplyBQSR` (dbSNP known sites) | `<sample>_recall.bam` |
+| Somatic variant calling | `gatk Mutect2` with `--panel-of-normals` and `--germline-resource` | `<sample>.vcf` |
+| Filtering | `gatk FilterMutectCalls`, then `bcftools view -f PASS` | `<sample>_filtered.vcf`, `<sample>_filtered_pass.vcf` |
+
+Samples are processed one after another; individual tools use multiple threads (BWA 32, samtools 12, Spark 12 local cores). Edit these values in the script to match your machine.
+
+## Requirements
+
+- BWA, samtools, fastp, bcftools
+- GATK 4.x
+- Reference files for hg38: genome FASTA with BWA and samtools indexes and a sequence dictionary, dbSNP VCF (indexed), a panel of normals VCF, and a gnomAD allele-frequency-only VCF
+
+Example installation on Ubuntu:
+
 ```sh
 sudo apt update && sudo apt install -y bwa samtools fastp bcftools
 gatk_version="4.2.6.1"
@@ -26,134 +36,55 @@ unzip gatk-$gatk_version.zip && mv gatk-$gatk_version /opt/gatk
 export PATH=/opt/gatk:$PATH
 ```
 
-## Usage
-Run the pipeline by executing the script with your FASTQ directory:
-```sh
-bash somatic_variant_calling.sh /path/to/fastq_files
-```
+The file [`Pre-requisites`](Pre-requisites) lists download commands for the reference genome and the resource VCFs.
 
-The script will:
-1. Perform **quality control** using Fastp
-2. Align reads to **hg38 reference genome** using BWA-MEM
-3. Apply **duplicate marking and base recalibration** using GATK
-4. Call **somatic variants** using Mutect2
-5. Filter **high-confidence somatic variants**
+## Configuration
 
-## Output Files
-- **Mapped BAM files** (with alignment statistics)
-- **Filtered VCF files** (variant calls)
-- **Quality control reports**
-- **Log files for tracking errors and progress**
-
-## Script
-The following is the **full pipeline script**:
+Set the paths at the top of the script before running:
 
 ```bash
-#!/bin/bash
-# Somatic Variant Calling Pipeline
-set +e  # Allow the script to continue even if some samples fail
-set -o pipefail  # Ensure pipeline failures are detected
-
-inputDir=$(pwd)
-completedDir="$inputDir/Analysis_Completed"
-errorDir="$inputDir/Error_Samples"
-mkdir -p "$completedDir" "$errorDir"
-
-dir_qc="$inputDir/fastqc"
-dir_fastp="$inputDir/filtered_qc_report"
-dir_map="$inputDir/Mapsam"
-dir_vcf="$inputDir/Somatic_VCF"
-mkdir -p "$dir_map" "$dir_vcf"
-
 file_ref="/path/to/reference/hg38.fa"
 known_site="/path/to/vcf/dbsnp.vcf.gz"
-platform="ILLUMINA"
 pon="/path/to/vcf/somatic-hg38_1000g_pon.vcf"
 af_only="/path/to/vcf/somatic-hg38_af-only-gnomad.vcf"
-tmp="/path/to/tmp"
-
-timestamp=$(date +'%Y%m%d%H%M%S')
-log_file="$inputDir/log_${timestamp}.txt"
-terminal_log="$inputDir/terminal_log_${timestamp}.txt"
-exec > >(tee -a "$terminal_log") 2>&1
-
-echo "Script started." | tee -a "$log_file"
-
-samples=()
-for f in "$inputDir"/*_1.fastq.gz; do
-    if [ -f "$f" ]; then
-        sampleName=$(basename "$f" "_1.fastq.gz")
-        samples+=("$sampleName")
-    fi
-done
-
-unique_samples=($(printf "%s\n" "${samples[@]}" | sort -u))
-numSamples=${#unique_samples[@]}
-echo "Total samples: $numSamples" | tee -a "$log_file"
-
-process_sample() {
-    local sample="$1"
-    echo "Processing sample: $sample" | tee -a "$log_file"
-    
-    local filep1="$inputDir/${sample}_1.fastq.gz"
-    local filep2="$inputDir/${sample}_2.fastq.gz"
-    
-    if [ ! -f "$filep1" ] || [ ! -f "$filep2" ]; then
-        echo "ERROR: Missing files for $sample" | tee -a "$log_file"
-        return 1
-    fi
-    
-    mkdir -p "$dir_qc" "$dir_fastp"
-    
-    fastp -i "$filep1" -I "$filep2" \
-         -o "${dir_fastp}/${sample}_1_filtered.fastq.gz" \
-         -O "${dir_fastp}/${sample}_2_filtered.fastq.gz" \
-         --html "${dir_fastp}/${sample}.html" --thread 2
-    
-    bwa mem -t 32 -R "@RG\tID:${sample}\tPL:${platform}\tSM:${sample}" \
-        "$file_ref" "${dir_fastp}/${sample}_1_filtered.fastq.gz" "${dir_fastp}/${sample}_2_filtered.fastq.gz" | \
-        samtools sort -@ 12 -O BAM -o "${dir_map}/${sample}.bam"
-
-    gatk AddOrReplaceReadGroups -I "${dir_map}/${sample}.bam" \
-        -O "${dir_map}/${sample}_RG.bam" \
-        --RGLB "Lib-${sample}" --RGPL "$platform" \
-        --RGPU "${platform}_${sample}" --RGSM "$sample" \
-        --VALIDATION_STRINGENCY LENIENT
-  
-    samtools flagstat "${dir_map}/${sample}.bam" > "${dir_map}/${sample}.Stat.txt"
-
-    gatk MarkDuplicatesSpark -I "${dir_map}/${sample}.bam" \
-        -O "${dir_map}/${sample}_markdup.bam" --spark-master local[12]
-    
-    gatk BaseRecalibrator -I "${dir_map}/${sample}_markdup.bam" \
-        --known-sites "$known_site" -O "${dir_map}/${sample}_recall.table" -R "$file_ref"
-    
-    gatk ApplyBQSR --bqsr-recal-file "${dir_map}/${sample}_recall.table" \
-        -I "${dir_map}/${sample}_markdup.bam" -O "${dir_map}/${sample}_recall.bam" -R "$file_ref"
-    
-    gatk Mutect2 -R "$file_ref" -I "${dir_map}/${sample}_recall.bam" \
-        --germline-resource "$af_only" --panel-of-normals "$pon" \
-        -O "${dir_vcf}/${sample}.vcf"
-    
-    gatk FilterMutectCalls -R "$file_ref" -V "${dir_vcf}/${sample}.vcf" \
-        -O "${dir_vcf}/${sample}_filtered.vcf"
-    
-    bcftools view -f PASS "${dir_vcf}/${sample}_filtered.vcf" -o "${dir_vcf}/${sample}_filtered_pass.vcf"}
-
-for sample in "${unique_samples[@]}"; do
-    if process_sample "$sample"; then
-        mv "$inputDir/${sample}_1.fastq.gz" "$completedDir/"
-        mv "$inputDir/${sample}_2.fastq.gz" "$completedDir/"
-    else
-        mv "$inputDir/${sample}_1.fastq.gz" "$errorDir/"
-        mv "$inputDir/${sample}_2.fastq.gz" "$errorDir/"
-    fi
-done
-
-echo "Pipeline completed." | tee -a "$log_file"
 ```
 
-## License
-This pipeline is released under the MIT License.
+## Input
 
-For any issues or improvements, feel free to contribute!
+Paired-end, gzipped FASTQ files in one directory, named `<sample>_1.fastq.gz` and `<sample>_2.fastq.gz`.
+
+## Usage
+
+The script works on the **current working directory**, so run it from the folder that contains the FASTQ files:
+
+```sh
+cd /path/to/fastq_files
+bash /path/to/somatic_variant_calling.sh
+```
+
+## Output
+
+Created inside the FASTQ directory:
+
+```
+filtered_qc_report/     fastp-filtered FASTQ files and HTML QC reports
+Mapsam/                 BAM files, flagstat summaries, BQSR tables, recalibrated BAMs
+Somatic_VCF/            raw Mutect2 VCF, FilterMutectCalls VCF, PASS-only VCF per sample
+Analysis_Completed/     input FASTQ pairs of samples that finished
+Error_Samples/          input FASTQ pairs of samples that failed
+log_<timestamp>.txt, terminal_log_<timestamp>.txt
+```
+
+## Notes and limitations
+
+- Tumour-only calling is less specific than tumour-normal calling; results should be interpreted with that in mind.
+- The script does not stop on errors (`set +e`). A sample is moved to `Error_Samples/` if its FASTQ pair is missing or the final filtering step fails; check the logs for errors in intermediate steps.
+- No annotation step is included; annotate the PASS VCFs with a tool of your choice (for example VEP or ANNOVAR).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
+
+## Author
+
+Sourabh Kumar · [bioinfosourabh@gmail.com](mailto:bioinfosourabh@gmail.com) · [bioinfosourabh.netlify.app](https://bioinfosourabh.netlify.app) · ORCID [0009-0009-5840-9830](https://orcid.org/0009-0009-5840-9830)
